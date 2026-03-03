@@ -82,9 +82,23 @@ var (
 		},
 		[]string{"container_id", "name", "nodename", "service", "stack"},
 	)
+
+	exporterScrapeErrors = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "docker_exporter_scrape_errors_total",
+			Help: "Total number of errors during Docker stats scrape.",
+		},
+	)
+
+	exporterLastScrapeSuccess = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "docker_exporter_last_scrape_success",
+			Help: "Whether the last scrape of Docker stats was successful (1) or had errors (0).",
+		},
+	)
 )
 
-func processContainer(ctx context.Context, cli *client.Client, c types.Container, nodeName string) {
+func processContainer(ctx context.Context, cli *client.Client, c types.Container, nodeName string) error {
 	service := ""
 	stack := ""
 
@@ -104,14 +118,14 @@ func processContainer(ctx context.Context, cli *client.Client, c types.Container
 	stats, err := cli.ContainerStatsOneShot(ctx, c.ID)
 	if err != nil {
 		log.Println("stats:", c.ID, err)
-		return
+		return err
 	}
 	defer stats.Body.Close()
 
 	var s types.StatsJSON
 	if err := json.NewDecoder(stats.Body).Decode(&s); err != nil {
 		log.Println("decode:", err)
-		return
+		return err
 	}
 
 	name := ""
@@ -154,6 +168,8 @@ func processContainer(ctx context.Context, cli *client.Client, c types.Container
 	}
 	containerNetRx.WithLabelValues(c.ID, name, nodeName, service, stack).Set(rxTotal)
 	containerNetTx.WithLabelValues(c.ID, name, nodeName, service, stack).Set(txTotal)
+
+	return nil
 }
 
 func collectLoop(cli *client.Client, nodeName string) {
@@ -171,13 +187,17 @@ func collectLoop(cli *client.Client, nodeName string) {
 
 	for range ticker.C {
 		ctx := context.Background()
+		exporterLastScrapeSuccess.Set(0)
+
 		containers, err := cli.ContainerList(ctx, container.ListOptions{})
 		if err != nil {
 			log.Println("list containers:", err)
+			exporterScrapeErrors.Inc()
 			continue
 		}
 
 		if len(containers) == 0 {
+			exporterLastScrapeSuccess.Set(1)
 			continue
 		}
 
@@ -189,24 +209,25 @@ func collectLoop(cli *client.Client, nodeName string) {
 		jobs := make(chan types.Container)
 		var wg sync.WaitGroup
 
-		// стартуємо воркери
 		for i := 0; i < workerCount; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				for c := range jobs {
-					processContainer(ctx, cli, c, nodeName)
+					if err := processContainer(ctx, cli, c, nodeName); err != nil {
+						exporterScrapeErrors.Inc()
+					}
 				}
 			}()
 		}
 
-		// кидаємо контейнери в jobs
 		for _, c := range containers {
 			jobs <- c
 		}
 		close(jobs)
 
 		wg.Wait()
+		exporterLastScrapeSuccess.Set(1)
 	}
 }
 
@@ -220,6 +241,8 @@ func main() {
 		containerCPU,
 		containerNetRx,
 		containerNetTx,
+		exporterScrapeErrors,
+		exporterLastScrapeSuccess,
 	)
 
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -233,8 +256,18 @@ func main() {
 	}
 	go collectLoop(cli, nodeName)
 
-	log.Println("starting exporter on :9273")
+	listenAddr := os.Getenv("LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = ":9273"
+	}
+
+	log.Println("starting exporter on", listenAddr)
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK\n"))
+	})
 	http.Handle("/metrics", promhttp.Handler())
-	log.Println("listening on :9273")
-	log.Fatal(http.ListenAndServe(":9273", nil))
+
+	log.Println("listening on", listenAddr)
+	log.Fatal(http.ListenAndServe(listenAddr, nil))
 }
