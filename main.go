@@ -6,7 +6,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -82,10 +84,89 @@ var (
 	)
 )
 
+func processContainer(ctx context.Context, cli *client.Client, c types.Container, nodeName string) {
+	service := ""
+	stack := ""
+
+	if v, ok := c.Labels["com.docker.swarm.service.name"]; ok {
+		service = v
+	}
+	if v, ok := c.Labels["com.docker.compose.service"]; ok && service == "" {
+		service = v
+	}
+	if v, ok := c.Labels["com.docker.stack.namespace"]; ok {
+		stack = v
+	}
+	if v, ok := c.Labels["com.docker.compose.project"]; ok && stack == "" {
+		stack = v
+	}
+
+	stats, err := cli.ContainerStatsOneShot(ctx, c.ID)
+	if err != nil {
+		log.Println("stats:", c.ID, err)
+		return
+	}
+	defer stats.Body.Close()
+
+	var s types.StatsJSON
+	if err := json.NewDecoder(stats.Body).Decode(&s); err != nil {
+		log.Println("decode:", err)
+		return
+	}
+
+	name := ""
+	if len(c.Names) > 0 {
+		name = strings.TrimPrefix(c.Names[0], "/")
+	}
+
+	// memory
+	memUsage := float64(s.MemoryStats.Usage)
+	memRSS := float64(s.MemoryStats.Stats["rss"])
+	memCache := float64(s.MemoryStats.Stats["cache"])
+	memLimit := float64(s.MemoryStats.Limit)
+	memMax := float64(s.MemoryStats.MaxUsage)
+
+	containerMem.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memUsage)
+	containerMemRSS.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memRSS)
+	containerMemCache.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memCache)
+	containerMemLimit.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memLimit)
+	containerMemMax.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memMax)
+
+	// cpu
+	cpuDelta := float64(s.CPUStats.CPUUsage.TotalUsage - s.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(s.CPUStats.SystemUsage - s.PreCPUStats.SystemUsage)
+	cpuRatio := 0.0
+	if systemDelta > 0 {
+		onlineCPUs := float64(len(s.CPUStats.CPUUsage.PercpuUsage))
+		if onlineCPUs == 0 {
+			onlineCPUs = 1
+		}
+		cpuRatio = (cpuDelta / systemDelta) * onlineCPUs
+	}
+	containerCPU.WithLabelValues(c.ID, name, nodeName, service, stack).Set(cpuRatio)
+
+	// network
+	rxTotal := 0.0
+	txTotal := 0.0
+	for _, v := range s.Networks {
+		rxTotal += float64(v.RxBytes)
+		txTotal += float64(v.TxBytes)
+	}
+	containerNetRx.WithLabelValues(c.ID, name, nodeName, service, stack).Set(rxTotal)
+	containerNetTx.WithLabelValues(c.ID, name, nodeName, service, stack).Set(txTotal)
+}
+
 func collectLoop(cli *client.Client, nodeName string) {
 	log.Println("starting collect loop")
 
-	ticker := time.NewTicker(10 * time.Second)
+	intervalSec := 10
+	if v := os.Getenv("SCRAPE_INTERVAL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			intervalSec = n
+		}
+	}
+
+	ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -96,82 +177,36 @@ func collectLoop(cli *client.Client, nodeName string) {
 			continue
 		}
 
-		for _, c := range containers {
-			service := ""
-			stack := ""
-
-			// swarm service name
-			if v, ok := c.Labels["com.docker.swarm.service.name"]; ok {
-				service = v
-			}
-			// docker‑compose service name
-			if v, ok := c.Labels["com.docker.compose.service"]; ok && service == "" {
-				service = v
-			}
-
-			// swarm stack namespace (docker stack deploy)
-			if v, ok := c.Labels["com.docker.stack.namespace"]; ok {
-				stack = v
-			}
-			// docker‑compose project name
-			if v, ok := c.Labels["com.docker.compose.project"]; ok && stack == "" {
-				stack = v
-			}
-
-			stats, err := cli.ContainerStatsOneShot(ctx, c.ID)
-			if err != nil {
-				log.Println("stats:", c.ID, err)
-				continue
-			}
-			var s types.StatsJSON
-			if err := json.NewDecoder(stats.Body).Decode(&s); err != nil {
-				log.Println("decode:", err)
-				stats.Body.Close()
-				continue
-			}
-			stats.Body.Close()
-
-			name := ""
-			if len(c.Names) > 0 {
-				name = strings.TrimPrefix(c.Names[0], "/")
-			}
-
-			// memory
-			memUsage := float64(s.MemoryStats.Usage)
-			memRSS := float64(s.MemoryStats.Stats["rss"])
-			memCache := float64(s.MemoryStats.Stats["cache"])
-			memLimit := float64(s.MemoryStats.Limit)
-			memMax := float64(s.MemoryStats.MaxUsage)
-
-			containerMem.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memUsage)
-			containerMemRSS.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memRSS)
-			containerMemCache.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memCache)
-			containerMemLimit.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memLimit)
-			containerMemMax.WithLabelValues(c.ID, name, nodeName, service, stack).Set(memMax)
-
-			cpuDelta := float64(s.CPUStats.CPUUsage.TotalUsage - s.PreCPUStats.CPUUsage.TotalUsage)
-			systemDelta := float64(s.CPUStats.SystemUsage - s.PreCPUStats.SystemUsage)
-			cpuRatio := 0.0
-			if systemDelta > 0 {
-				onlineCPUs := float64(len(s.CPUStats.CPUUsage.PercpuUsage))
-				if onlineCPUs == 0 {
-					onlineCPUs = 1
-				}
-				cpuRatio = (cpuDelta / systemDelta) * onlineCPUs
-			}
-			// cpu
-			containerCPU.WithLabelValues(c.ID, name, nodeName, service, stack).Set(cpuRatio)
-
-			rxTotal := 0.0
-			txTotal := 0.0
-			for _, v := range s.Networks {
-				rxTotal += float64(v.RxBytes)
-				txTotal += float64(v.TxBytes)
-			}
-			// network
-			containerNetRx.WithLabelValues(c.ID, name, nodeName, service, stack).Set(rxTotal)
-			containerNetTx.WithLabelValues(c.ID, name, nodeName, service, stack).Set(txTotal)
+		if len(containers) == 0 {
+			continue
 		}
+
+		workerCount := 10
+		if len(containers) < workerCount {
+			workerCount = len(containers)
+		}
+
+		jobs := make(chan types.Container)
+		var wg sync.WaitGroup
+
+		// стартуємо воркери
+		for i := 0; i < workerCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for c := range jobs {
+					processContainer(ctx, cli, c, nodeName)
+				}
+			}()
+		}
+
+		// кидаємо контейнери в jobs
+		for _, c := range containers {
+			jobs <- c
+		}
+		close(jobs)
+
+		wg.Wait()
 	}
 }
 
